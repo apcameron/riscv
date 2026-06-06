@@ -23,12 +23,11 @@ EAPI=8
 # using an external CI system that we have some control over, in case
 # issues pop up again with official tarball generation.
 
-GN_MIN_VER=0.2318
+GN_MIN_VER=0.2354
 # chromium-tools/get-chromium-toolchain-strings.py (or just use Chromicler)
-# Node for M145+ should be 24.12.0 but that's not packaged in Gentoo yet. See #969145
 TEST_FONT="a28b222b79851716f8358d2800157d9ffe117b3545031ae51f69b7e1e1b9a969"
-BUNDLED_CLANG_VER="llvmorg-23-init-2224-g5bd8dadb-3"
-BUNDLED_RUST_VER="7d8ebe3128fc87f3da1ad64240e63ccf07b8f0bd-3"
+BUNDLED_CLANG_VER="llvmorg-23-init-5669-g8a0be0bc-4"
+BUNDLED_RUST_VER="6f54d591c3116ee7f8ce9321ddeca286810cc142-7"
 RUST_SHORT_HASH=${BUNDLED_RUST_VER:0:10}-${BUNDLED_RUST_VER##*-}
 NODE_VER="24.12.0"
 ESBUILD_VER="0.25.1"
@@ -52,8 +51,8 @@ inherit python-any-r1 readme.gentoo-r1 rust systemd toolchain-funcs virtualx xdg
 
 DESCRIPTION="Open-source version of Google Chrome web browser"
 HOMEPAGE="https://www.chromium.org/"
-PPC64_HASH="eeff222874ccb0a1e67d0de18bcc9215eecd2105"
-PATCH_V="${PV%%\.*}-2"
+PPC64_HASH="a85b64f07b489b8c6fdb13ecf79c16c56c560fc6"
+PATCH_V="${PV%%\.*}-3"
 COPIUM_COMMIT="fe1caafa06f27542c18a881348f78e984e2d9fe2"
 SRC_URI="https://github.com/chromium-linux-tarballs/chromium-tarballs/releases/download/${PV}/chromium-${PV}-linux.tar.xz
 	https://deps.gentoo.zip/www-client/chromium/rollup-wasm-node-${ROLLUP_VER}.tgz
@@ -86,11 +85,11 @@ SLOT="stable"
 # Unstable in gentoo exists mostly to give devs some breathing room for beta/stable releases.
 # It shouldn't be keyworded but adventurous users are encouraged to select it;
 # there's official dev channel Google Chrome after all.
-KEYWORDS="amd64 arm64 ~ppc64 ~riscv"
+KEYWORDS="amd64 arm64 ~riscv"
 
 IUSE_SYSTEM_LIBS="+system-harfbuzz +system-icu +system-zstd"
 IUSE="+X ${IUSE_SYSTEM_LIBS} bindist bundled-toolchain cups debug ffmpeg-chromium gtk4 +hangouts headless kerberos +official pax-kernel pgo"
-IUSE+=" +proprietary-codecs pulseaudio qt6 +rar +screencast selinux test +vaapi +wayland +widevine cpu_flags_ppc_vsx3"
+IUSE+=" +proprietary-codecs pulseaudio qt6 +rar +screencast selinux test +vaapi +wayland +widevine cpu_flags_ppc_vsx3 cpu_flags_riscv_v"
 RESTRICT="
 	!bindist? ( bindist )
 	!test? ( test )
@@ -233,6 +232,7 @@ BDEPEND="
 	>=sys-devel/bison-2.4.3
 	sys-devel/flex
 	virtual/pkgconfig
+	x11-misc/xdg-utils
 "
 
 if ! has chromium_pkg_die ${EBUILD_DEATH_HOOKS}; then
@@ -502,12 +502,14 @@ src_prepare() {
         "${FILESDIR}/riscv-sandbox.patch"
         "${FILESDIR}/riscv-swiftshader.patch"
         "${FILESDIR}/riscv-misc.patch"
-        "${FILESDIR}/riscv-v8.patch"
         "${FILESDIR}/riscv-tflite.patch"
-        "${FILESDIR}/riscv-disable-rvv.patch"
-        "${FILESDIR}/blink.patch"
+        "${FILESDIR}/riscv-v8.patch"
     )
-	
+    # Only include the patch if the target CPU does NOT support RVV
+    if ! use cpu_flags_riscv_v; then
+        PATCHES+=( "${FILESDIR}/riscv-xnnpack-disable-rvv.patch" )
+    fi
+
 	# https://issues.chromium.org/issues/442698344
 	# Unreleased fontconfig changed magic numbers and google have rolled to this version
 	if has_version "<=media-libs/fontconfig-2.17.1"; then
@@ -588,14 +590,17 @@ src_prepare() {
 		if use ppc64; then
 			local patchset_dir="${WORKDIR}/openpower-patches-${PPC64_HASH}/patches"
 			# patch causes build errors on 4K page systems (https://bugs.gentoo.org/show_bug.cgi?id=940304)
+			local page_size_patch="ppc64le/third_party/use-sysconf-page-size-on-ppc64.patch"
 			local isa_3_patch="ppc64le/core/baseline-isa-3-0.patch"
-			openpower_patches=(
-				$(grep -E "^ppc64le|^upstream" "${patchset_dir}/series" | grep -v "${isa_3_patch}" |
-					grep -v "upstream" || die) # M146 `upstream` dir dropped but still referenced in series file.
-			)
+			# Apply the OpenPOWER patches (check for page size and isa 3.0)
+			openpower_patches=( $(grep -E "^ppc64le|^upstream" "${patchset_dir}/series" | grep -v "${page_size_patch}" |
+				grep -v "${isa_3_patch}" || die) )
 			for patch in "${openpower_patches[@]}"; do
 				PATCHES+=( "${patchset_dir}/${patch}" )
 			done
+			if [[ $(getconf PAGESIZE) == 65536 ]]; then
+				PATCHES+=( "${patchset_dir}/${page_size_patch}" )
+			fi
 			# We use vsx3 as a proxy for 'want isa3.0' (POWER9)
 			if use cpu_flags_ppc_vsx3 ; then
 				PATCHES+=( "${patchset_dir}/${isa_3_patch}" )
@@ -616,7 +621,7 @@ src_prepare() {
 
 	fi
 
-	# Do this before we apply patches so that ppc64 can be applied without faffing around.
+	# Do this before we apply patches since (e.g.) ppc64 needs to patch rollup and it's easier in ${S}
 	einfo "Moving rollup wasm-node package into place ..."
 	mkdir -p third_party/devtools-frontend/src/node_modules/@rollup/wasm-node ||
 		die "Failed to create node_modules/@rollup/wasm-node"
@@ -647,6 +652,7 @@ src_prepare() {
 	local esbuild_path="${S}/third_party/devtools-frontend/src/third_party/esbuild"
 	local -A restore_list=(
 		["/usr/bin/esbuild-${ESBUILD_VER}"]="${esbuild_path}/esbuild"
+		["/usr/bin/gperf"]="${S}/third_party/gperf/cipd/bin/gperf"
 		["/usr/bin/node"]="${S}/third_party/node/linux/node-linux-x64/bin/node"
 	)
 
@@ -657,6 +663,9 @@ src_prepare() {
 			# Make sure the parent dir exists; some tarballs don't include (e.g.) node's bindir
 			mkdir -p "$(dirname "${dst}")" || die "Failed to create directory for ${dst}"
 			ln -s "${src}" "${dst}" || die "Failed to symlink ${dst} from ${src}"
+			if [[ ! -L "${dst}" || "$(readlink -f "${dst}")" != "${src}" ]]; then
+				die "Symlink verification failed for ${dst} -> ${src}"
+			fi
 		else
 			die "Expected to find ${src} to restore ${dst}, but it does not exist."
 		fi
@@ -731,7 +740,7 @@ src_prepare() {
 		third_party/dav1d
 		third_party/dawn
 		third_party/dawn/third_party/gn/webgpu-cts
-		third_party/dawn/third_party/khronos
+		third_party/dawn/third_party/OpenGL-Registry
 		third_party/dawn/third_party/renderdoc
 		third_party/dawn/third_party/webgpu-headers
 		third_party/depot_tools
@@ -785,6 +794,7 @@ src_prepare() {
 		third_party/google_input_tools/third_party/closure_library
 		third_party/google_input_tools/third_party/closure_library/third_party/closure
 		third_party/googletest
+		third_party/gperf # We symlink system gperf, but this will purge the symlink since we tidy up afterwards.
 		third_party/highway
 		third_party/hunspell
 		third_party/ink_stroke_modeler/src/ink_stroke_modeler
@@ -808,7 +818,6 @@ src_prepare() {
 		third_party/libaddressinput
 		third_party/libaom
 		third_party/libaom/source/libaom/third_party/fastfeat
-		third_party/libaom/source/libaom/third_party/SVT-AV1
 		third_party/libaom/source/libaom/third_party/vector
 		third_party/libaom/source/libaom/third_party/x86inc
 		third_party/libc++
@@ -870,6 +879,7 @@ src_prepare() {
 		third_party/perfetto
 		third_party/perfetto/protos/third_party/chromium
 		third_party/perfetto/protos/third_party/pprof
+		third_party/perfetto/protos/third_party/primes
 		third_party/perfetto/protos/third_party/simpleperf
 		third_party/pffft
 		third_party/ply
@@ -954,7 +964,6 @@ src_prepare() {
 		# gyp -> gn leftovers
 		third_party/speech-dispatcher
 		third_party/usb_ids
-		third_party/xdg-utils
 	)
 
 	if use rar; then
@@ -975,7 +984,7 @@ src_prepare() {
 
 	# USE=system-*
 	if ! use system-harfbuzz; then
-		keeplibs+=( third_party/harfbuzz-ng )
+		keeplibs+=( third_party/harfbuzz )
 	fi
 
 	if ! use system-icu; then
@@ -1052,6 +1061,9 @@ src_prepare() {
 chromium_configure() {
 	# Calling this here supports resumption via FEATURES=keepwork
 	python_setup
+
+	# 974899: sometimes people try to build with a non-Unicode locale and python gets very upset
+	python_export_utf8_locale || die "Chromium builds require a UTF-8 locale."
 
 	# Bug 491582.
 	export TMPDIR="${WORKDIR}/temp"
@@ -1528,10 +1540,7 @@ src_test() {
 		'AlternateTestParams/PartitionAllocTest.*' # 200+ tests, >= 1 crashes entire test runner with usersandbox.
 		'CheckExitCodeAfterSignalHandlerDeathTest.*'
 		'CriticalProcessAndThreadSpotChecks/HangWatcherAnyCriticalThreadTests.*'
-		'PostJobTest.*' # M145 - fixed in 146?
 		'LazyThreadPoolTaskRunnerEnvironmentTest.*' # M142
-		'LazyThreadPoolTaskRunnerTest.*'
-		'SequenceManager*' # Crashes test runner
 		'ToolsSanityTest.BadVirtualCall*'
 		# requires en-us locale
 		SysStrings.SysNativeMBAndWide
@@ -1549,12 +1558,14 @@ src_test() {
 		StackTraceDeathTest.StackDumpSignalHandlerIsMallocFree
 		TestLauncherTools.TruncateSnippetFocusedMatchesFatalMessagesTest
 		ThreadPoolEnvironmentConfig.CanUseBackgroundPriorityForWorker
+		# M148 Beta
+		RunUntilTestWithMockTime.ConditionOnlyObservedIfWorkIsDone
 	)
 	local test_filter="-$(IFS=:; printf '%s' "${skip_tests[*]}")"
 	# test-launcher-bot-mode enables parallelism and plain output
 	# Check individual tests with --gtest_filter=<test you want> --single-process-tests
 	./out/Release/base_unittests --test-launcher-bot-mode \
-		--test-launcher-jobs="$(makeopts_jobs)" \
+		--test-launcher-jobs="$(get_makeopts_jobs)" \
 		--gtest_filter="${test_filter}" || die "Tests failed!"
 }
 
@@ -1626,9 +1637,6 @@ src_install() {
 		local files=(out/Release/*.so out/Release/*.so.[0-9])
 		[[ ${#files[@]} -gt 0 ]] && doins "${files[@]}"
 	)
-
-	# Install bundled xdg-utils, avoids installing X11 libraries with USE="-X wayland"
-	doins out/Release/xdg-{settings,mime}
 
 	if ! use system-icu && ! use headless; then
 		doins out/Release/icudtl.dat
@@ -1741,6 +1749,7 @@ pkg_postinst() {
 		ewarn "please complete the configuration of this system before logging any bugs."
 	fi
 
+	# Stable slot doesn't change profile directory, and it's vanishingly unlikely that users will downgrade from dev.
 	if [[ -n "${REPLACING_VERSIONS}" ]]; then
 		local replacing_non_slotted=false
 		# there could be more than one PVR
